@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""
+importarr.py — Manual bulk import to Sonarr or Radarr (dual-mode)
+
+- Scans a folder for media files
+- Groups by inferred "prefix" (Sonarr: up to SxxEyy; Radarr: title(+year))
+- Lets you confirm the right library item once per prefix
+- Triggers manual import with quality, languages, release group
+- Optionally cleans Activity → Queue after import
+
+Examples:
+  python importarr.py --mode sonarr /mnt/user/usenet/complete
+  python importarr.py --mode radarr /mnt/user/usenet/complete/movies --copy
+"""
+
+import argparse, re, requests
+from pathlib import Path
+from time import sleep
+
+# ---------- CONFIG ----------
+API_URL = "http://localhost:8989/api/v3"  # Sonarr default; override with --api
+API_KEY = ""                              # set via --apikey or here
+headers = lambda key: {"X-Api-Key": key}
+
+# Host → Container mappings
+PATH_MAP = {
+    "/mnt/user/usenet/complete": "/data/complete",
+    "/mnt/cache/usenet/complete": "/data/complete",
+}
+
+VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov"}
+SONARR_PREFIX_RE = re.compile(r"^(.*?)(S\d{1,2}E\d{1,2})", re.IGNORECASE)
+YEAR_RE = re.compile(r"(19|20)\d{2}")
+
+# ---------- helpers ----------
+def map_path_to_container(host_path: Path, path_map: dict) -> str:
+    s = str(host_path)
+    for hp, cp in path_map.items():
+        if s.startswith(hp):
+            m = s.replace(hp, cp, 1)
+            print(f"🔄 Path mapping: {s} → {m}")
+            return m
+    print(f"⚠️ No path mapping found for: {s}")
+    return s
+
+def fetch_languages(api, key):
+    r = requests.get(f"{api}/language", headers=headers(key))
+    r.raise_for_status()
+    langs = r.json()
+    m = {(l.get("name") or "").lower(): l for l in langs}
+    for l in langs:
+        v = (l.get("englishName") or "").lower()
+        if v and v not in m:
+            m[v] = l
+    return langs, m
+
+def detect_language_objs(filename: str, lang_map: dict):
+    n = filename.lower()
+    if "german" in n or ".ger" in n or "german." in n:
+        key = "german"
+    elif "english" in n or ".eng" in n or "english." in n:
+        key = "english"
+    else:
+        key = "unknown"
+    if key in lang_map:
+        return [lang_map[key]]
+    for k in ("unknown", "original"):
+        if k in lang_map:
+            return [lang_map[k]]
+    return [{"id": 0, "name": "Unknown", "nameLower": "unknown"}]
+
+def build_quality(file_name: str):
+    q = "Unknown"; n = file_name.lower()
+    if "2160p" in n or "4k" in n: q = "WEBDL-2160p"
+    elif "1080p" in n:           q = "WEBDL-1080p"
+    elif "720p"  in n:           q = "WEBDL-720p"
+    return {"quality": {"name": q}, "revision": {"version": 1, "real": 0, "isRepack": False}}
+
+def release_group_from_name(file_name: str):
+    m = re.search(r"-([A-Za-z0-9]+)(?:\.[^.]+)?$", file_name)
+    return m.group(1) if m else None
+
+# ---------- SONARR bits ----------
+def sonarr_lookup(api, key, term, restrict_ids=None):
+    r = requests.get(f"{api}/series/lookup", headers=headers(key), params={"term": term})
+    r.raise_for_status()
+    res = r.json()
+    if restrict_ids:
+        out = []
+        for x in res:
+            if (f"tvdb:{x.get('tvdbId')}" in restrict_ids) or (f"tmdb:{x.get('tmdbId')}" in restrict_ids):
+                out.append(x)
+        return out
+    return res
+
+def sonarr_library_item(api, key, tvdb_id=None, tmdb_id=None):
+    r = requests.get(f"{api}/series", headers=headers(key))
+    r.raise_for_status()
+    for s in r.json():
+        if tvdb_id and s.get("tvdbId") == tvdb_id: return s
+        if tmdb_id and s.get("tmdbId") == tmdb_id: return s
+    return None
+
+def sonarr_find_episode(api, key, series_id: int, file_name: str):
+    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,2})", file_name)
+    if not m: return None, None, None
+    season, epnum = int(m.group(1)), int(m.group(2))
+    r = requests.get(f"{api}/episode", headers=headers(key), params={"seriesId": series_id})
+    r.raise_for_status()
+    for ep in r.json():
+        if ep["seasonNumber"] == season and ep["episodeNumber"] == epnum:
+            return season, epnum, ep
+    return season, epnum, None
+
+def sonarr_import(api, key, container_path, series, episode, quality, languages, release_group,
+                  import_mode, clean_after, queue_hint, remove_from_client, blocklist):
+    payload = {
+        "name": "manualImport",
+        "importMode": import_mode,
+        "files": [{
+            "path": container_path,
+            "seriesId": series["id"],
+            "episodeIds": [episode["id"]],
+            "quality": quality,
+            "languages": languages,
+            "releaseGroup": release_group
+        }]
+    }
+    print(f"🚀 POST /command (Sonarr) → {Path(container_path).name}")
+    r = requests.post(f"{api}/command", headers=headers(key), json=payload)
+    if r.status_code == 201:
+        print("✅ Manual import accepted.")
+        if clean_after:
+            sleep(1.5)
+            clean_queue(api, key, mode="sonarr", library_id=series["id"], hint=queue_hint,
+                        remove_from_client=remove_from_client, blocklist=blocklist)
+        return True
+    print(f"❌ Import failed: HTTP {r.status_code}")
+    print(r.text[:400])
+    return False
+
+# ---------- RADARR bits ----------
+def radarr_lookup(api, key, term, restrict_ids=None):
+    # Radarr prefers TMDB; pass the full filename term works fine
+    r = requests.get(f"{api}/movie/lookup", headers=headers(key), params={"term": term})
+    r.raise_for_status()
+    res = r.json()
+    if restrict_ids:
+        out = []
+        for x in res:
+            if (f"tmdb:{x.get('tmdbId')}" in restrict_ids) or (f"imdb:{x.get('imdbId')}" in restrict_ids):
+                out.append(x)
+        return out
+    return res
+
+def radarr_library_item(api, key, tmdb_id=None, imdb_id=None):
+    r = requests.get(f"{api}/movie", headers=headers(key))
+    r.raise_for_status()
+    for m in r.json():
+        if tmdb_id and m.get("tmdbId") == tmdb_id: return m
+        if imdb_id and (m.get("imdbId") or "").lower() == (imdb_id or "").lower(): return m
+    return None
+
+def radarr_guess_prefix(file_name: str):
+    """
+    Very light heuristic: prefix up to the year (if present), else filename sans tags.
+    """
+    base = Path(file_name).stem
+    m = YEAR_RE.search(base)
+    if m:
+        idx = m.start()
+        return base[:idx].rstrip(" ._-")
+    # strip common quality tags crudely
+    return re.split(r"\b(720p|1080p|2160p|4k|bluray|webrip|web[- ]?dl|h\.?264|x264|x265)\b", base, flags=re.I)[0].rstrip(" ._-")
+
+def radarr_import(api, key, container_path, movie, quality, languages, release_group,
+                  import_mode, clean_after, queue_hint, remove_from_client, blocklist):
+    payload = {
+        "name": "manualImport",
+        "importMode": import_mode,
+        "files": [{
+            "path": container_path,
+            "movieId": movie["id"],
+            "quality": quality,
+            "languages": languages,
+            "releaseGroup": release_group
+        }]
+    }
+    print(f"🚀 POST /command (Radarr) → {Path(container_path).name}")
+    r = requests.post(f"{api}/command", headers=headers(key), json=payload)
+    if r.status_code == 201:
+        print("✅ Manual import accepted.")
+        if clean_after:
+            sleep(1.5)
+            clean_queue(api, key, mode="radarr", library_id=movie["id"], hint=queue_hint,
+                        remove_from_client=remove_from_client, blocklist=blocklist)
+        return True
+    print(f"❌ Import failed: HTTP {r.status_code}")
+    print(r.text[:400])
+    return False
+
+# ---------- Queue cleanup (shared) ----------
+def clean_queue(api, key, mode: str, library_id: int | None, hint: str | None,
+                remove_from_client: bool, blocklist: bool):
+    """
+    Remove matching entries from Activity → Queue.
+    Sonarr rows have 'seriesId'; Radarr rows have 'movieId'.
+    """
+    try:
+        r = requests.get(f"{api}/queue", headers=headers(key))
+        r.raise_for_status()
+        items = r.json()
+    except Exception as e:
+        print(f"⚠️ Could not read queue: {e}")
+        return
+
+    removed = 0
+    for it in items:
+        title = (it.get("title") or "").lower()
+        sid   = it.get("seriesId") if mode == "sonarr" else it.get("movieId")
+        match = False
+        if library_id is not None and sid == library_id:
+            match = True
+        elif hint:
+            match = hint.lower() in title
+
+        if match:
+            qid = it["id"]
+            try:
+                requests.delete(
+                    f"{api}/queue/{qid}",
+                    headers=headers(key),
+                    params={
+                        "removeFromClient": str(remove_from_client).lower(),
+                        "blocklist": str(blocklist).lower()
+                    }
+                ).raise_for_status()
+                removed += 1
+            except Exception as e:
+                print(f"⚠️ Failed to delete queue item {qid}: {e}")
+
+    if removed:
+        print(f"🧹 Queue cleaned: removed {removed} item(s).")
+    else:
+        print("🧹 Queue: nothing to remove.")
+
+# ---------- processing ----------
+def process_file_sonarr(api, key, path_map, series, host_file: Path, import_mode, dry_run, lang_map, queue_hint,
+                        clean_after, remove_from_client, blocklist):
+    if host_file.suffix.lower() not in VIDEO_EXTS: return
+    if "sample" in host_file.name.lower(): return
+    cont_path = map_path_to_container(host_file, path_map)
+
+    season, epnum, ep = sonarr_find_episode(api, key, series["id"], host_file.name)
+    if not ep:
+        if season and epnum:
+            print(f"❌ Episode S{season:02d}E{epnum:02d} not found in Sonarr")
+        else:
+            print("❌ Could not read SxxEyy from filename")
+        return
+
+    print(f"✅ Episode: {ep['title']} (ID: {ep['id']})")
+    quality = build_quality(host_file.name)
+    rg      = release_group_from_name(host_file.name)
+    langs   = detect_language_objs(host_file.name, lang_map)
+
+    if dry_run:
+        print(f"💡 DRY-RUN → path={cont_path}, episodes={[ep['id']]}, quality={quality['quality']['name']}, "
+              f"langs={[l.get('name','?') for l in langs]}, rg={rg}, mode={import_mode}")
+        return
+
+    ok = sonarr_import(api, key, cont_path, series, ep, quality, langs, rg,
+                       import_mode, clean_after, queue_hint, remove_from_client, blocklist)
+    if ok:  print(f"🎉 Import queued: {host_file.name} → {series['title']}")
+    else:   print(f"💥 Import failed: {host_file.name}")
+
+def process_file_radarr(api, key, path_map, movie, host_file: Path, import_mode, dry_run, lang_map, queue_hint,
+                        clean_after, remove_from_client, blocklist):
+    if host_file.suffix.lower() not in VIDEO_EXTS: return
+    if "sample" in host_file.name.lower(): return
+    cont_path = map_path_to_container(host_file, path_map)
+
+    print(f"✅ Movie: {movie['title']} (ID: {movie['id']})")
+    quality = build_quality(host_file.name)
+    rg      = release_group_from_name(host_file.name)
+    langs   = detect_language_objs(host_file.name, lang_map)
+
+    if dry_run:
+        print(f"💡 DRY-RUN → path={cont_path}, movieId={movie['id']}, quality={quality['quality']['name']}, "
+              f"langs={[l.get('name','?') for l in langs]}, rg={rg}, mode={import_mode}")
+        return
+
+    ok = radarr_import(api, key, cont_path, movie, quality, langs, rg,
+                       import_mode, clean_after, queue_hint, remove_from_client, blocklist)
+    if ok:  print(f"🎉 Import queued: {host_file.name} → {movie['title']}")
+    else:   print(f"💥 Import failed: {host_file.name}")
+
+# ---------- CLI ----------
+def parse_args():
+    ap = argparse.ArgumentParser(description="Manual bulk import for Sonarr/Radarr (dual-mode)")
+    ap.add_argument("base", help="Base folder to scan")
+    ap.add_argument("--mode", choices=["sonarr","radarr"], required=True, help="API target")
+    ap.add_argument("--api", help="Override API base URL (e.g. http://localhost:7878/api/v3 for Radarr)")
+    ap.add_argument("--apikey", help="API key (overrides constant)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--ids", help="Filter lookup: tvdb:1234,tmdb:5678 (Sonarr) / tmdb:1234,imdb:tt1234567 (Radarr)")
+    ap.add_argument("--copy", action="store_true", help="Copy instead of Move")
+    ap.add_argument("--map-add", help="Add a host:container path mapping for this run")
+    ap.add_argument("--print-languages", action="store_true", help="List API languages and exit")
+
+    # Queue cleanup
+    ap.add_argument("--no-queue-clean", action="store_true", help="Do not remove matching items from Activity → Queue")
+    ap.add_argument("--keep-client", action="store_true", help="When deleting queue items, do NOT remove from download client")
+    ap.add_argument("--blocklist", action="store_true", help="Blocklist queue items when deleting")
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+    api = args.api or API_URL
+    key = args.apikey or API_KEY
+    if not key:
+        raise SystemExit("Set --apikey or fill API_KEY in the script.")
+
+    # optional extra mapping
+    path_map = dict(PATH_MAP)
+    if args.map_add:
+        hp, cp = args.map_add.split(":")
+        path_map[hp] = cp
+        print(f"➕ Mapping: {hp} → {cp}")
+
+    print(f"📂 Scanning {args.base}…")
+    print(f"🔧 API: {api}  (mode: {args.mode})")
+    print("🗂️ Mappings:")
+    for h, c in path_map.items(): print(f"   {h} → {c}")
+
+    # API check
+    requests.get(f"{api}/system/status", headers=headers(key)).raise_for_status()
+    print("✅ Connected to API")
+
+    langs, lang_map = fetch_languages(api, key)
+    if args.print_languages:
+        print("🌐 Languages:")
+        for l in langs: print(f"   id={l.get('id')}  name={l.get('name')}")
+        return
+
+    restrict_ids = args.ids.split(",") if args.ids else None
+    import_mode  = "Copy" if args.copy else "Move"
+    clean_after        = (not args.no_queue_clean)
+    remove_from_client = (not args.keep_client)
+    blocklist          = bool(args.blocklist)
+
+    base = Path(args.base)
+    cache = {}  # prefix -> library item
+
+    files = sorted(p for p in base.glob("**/*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS and "sample" not in p.name.lower())
+    for f in files:
+        if args.mode == "sonarr":
+            m = SONARR_PREFIX_RE.match(f.name)
+            if not m:
+                print(f"❌ No SxxEyy prefix match for {f.name}")
+                continue
+            prefix = m.group(1).rstrip(" ._-")
+            lookup_fn   = sonarr_lookup
+            library_fn  = sonarr_library_item
+        else:
+            prefix = radarr_guess_prefix(f.name)
+            lookup_fn   = radarr_lookup
+            library_fn  = radarr_library_item
+
+        if prefix in cache:
+            print(f"🔁 Using cached selection '{prefix}' → {cache[prefix].get('title')}")
+            if args.mode == "sonarr":
+                process_file_sonarr(api, key, path_map, cache[prefix], f, import_mode, args.dry_run,
+                                    lang_map, queue_hint=prefix,
+                                    clean_after=clean_after, remove_from_client=remove_from_client, blocklist=blocklist)
+            else:
+                process_file_radarr(api, key, path_map, cache[prefix], f, import_mode, args.dry_run,
+                                    lang_map, queue_hint=prefix,
+                                    clean_after=clean_after, remove_from_client=remove_from_client, blocklist=blocklist)
+            continue
+
+        print(f"🔍 Lookup for prefix: '{prefix}'")
+        results = lookup_fn(api, key, prefix, restrict_ids)
+        if not results:
+            print(f"❌ No matches for {f.name}")
+            continue
+
+        # interactive select; then fetch the LIBRARY item (must exist)
+        chosen = None
+        for i, r in enumerate(results, 1):
+            title, year = r.get("title"), r.get("year")
+            tvdb_id, tmdb_id = r.get("tvdbId"), r.get("tmdbId")
+            imdb_id = r.get("imdbId")
+            print(f"\n🎬 Option {i}: {f.name}")
+            ids_str = (f"TVDB:{tvdb_id} TMDB:{tmdb_id}" if args.mode=="sonarr"
+                       else f"TMDB:{tmdb_id} IMDB:{imdb_id}")
+            print(f"   Title: {title} ({year})  {ids_str}")
+            ans = input("Is this the correct title? (y/n/s=skip): ").strip().lower()
+            if ans == "y":
+                if args.mode == "sonarr":
+                    lib = library_fn(api, key, tvdb_id=tvdb_id, tmdb_id=tmdb_id)
+                else:
+                    lib = library_fn(api, key, tmdb_id=tmdb_id, imdb_id=imdb_id)
+                if not lib:
+                    print("❌ Title is not in your library – please add it first.")
+                    break
+                cache[prefix] = lib
+                chosen = lib
+                break
+            if ans == "s":
+                print(f"⏭️ Skipped: {f.name}")
+                break
+
+        if not chosen:
+            continue
+
+        if args.mode == "sonarr":
+            process_file_sonarr(api, key, path_map, chosen, f, import_mode, args.dry_run,
+                                lang_map, queue_hint=prefix,
+                                clean_after=clean_after, remove_from_client=remove_from_client, blocklist=blocklist)
+        else:
+            process_file_radarr(api, key, path_map, chosen, f, import_mode, args.dry_run,
+                                lang_map, queue_hint=prefix,
+                                clean_after=clean_after, remove_from_client=remove_from_client, blocklist=blocklist)
+
+if __name__ == "__main__":
+    main()
