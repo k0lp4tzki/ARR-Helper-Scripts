@@ -1,11 +1,11 @@
 
 ---
-# SORTARR
+# IMPORTARR
 
-SORTARR is a tiny CLI helper that mirrors Sonarr’s **Activity → Queue → Manual Import** flow in your terminal.  
+IMPORTARR is a tiny CLI helper that mirrors Sonarr’s **Activity → Queue → Manual Import** flow in your terminal.  
 It scans a downloads folder, extracts a **series prefix** (e.g. `Bluey.2019` from `Bluey.2019.S01E01…`), asks you to confirm the matching series, and then triggers Sonarr’s `manualImport` **command** for each episode (with language, quality, release group, and remote path mapping handled).
 
-> Designed for stubborn releases Sonarr won’t auto-import due to ID mismatches. You approve once, SORTARR does the rest.
+> Designed for stubborn releases Sonarr won’t auto-import due to ID mismatches. You approve once, IMPORTARR does the rest.
 
 ---
 
