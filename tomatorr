@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+import requests
+import argparse
+import time
+
+RADARR_URL = "http://localhost:7878/api/v3"
+RADARR_API = ""  # <--- Radarr API Key
+OMDB_API   = ""  # <--- OMDb API Key
+
+HEAD = {"X-Api-Key": RADARR_API}
+
+
+# ------------------------------
+# Helpers
+# ------------------------------
+
+def send_discord(webhook, message):
+    if not webhook:
+        return
+    try:
+        requests.post(webhook, json={"content": message})
+    except:
+        print("⚠️ Failed to send Discord message")
+
+
+def get_movies():
+    r = requests.get(f"{RADARR_URL}/movie", headers=HEAD)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_tomato_score(imdb_id):
+    if not imdb_id:
+        return None
+    url = f"http://www.omdbapi.com/?apikey={OMDB_API}&i={imdb_id}"
+    r = requests.get(url)
+    if r.status_code != 200:
+        return None
+
+    data = r.json()
+    for rt in data.get("Ratings", []):
+        if rt["Source"] == "Rotten Tomatoes":
+            try:
+                return int(rt["Value"].replace("%", ""))
+            except:
+                return None
+    return None
+
+
+def delete_movie(movie_id):
+    r = requests.delete(
+        f"{RADARR_URL}/movie/{movie_id}",
+        headers=HEAD,
+        params={"deleteFiles": "true", "addExclusion": "false"}
+    )
+    return r.status_code == 200
+
+
+# ------------------------------
+# Core logic
+# ------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Rotten Tomatoes Radarr Cleaner")
+    parser.add_argument("--force", action="store_true",
+                        help="Delete without asking")
+    parser.add_argument("--threshold", type=int, default=60,
+                        help="Minimum score required to keep a movie (default: 60)")
+    parser.add_argument("--discord", help="Discord webhook URL for reporting")
+    args = parser.parse_args()
+
+    deleted = []
+    total_checked = 0
+
+    print("📀 Fetching movies from Radarr…")
+    movies = get_movies()
+    print(f"Gefundene Filme: {len(movies)}")
+    print("--------------------------------------")
+
+    for m in movies:
+        total_checked += 1
+
+        title = m["title"]
+        imdb_id = m.get("imdbId")
+        year = m.get("year")
+        movie_id = m["id"]
+
+        print(f"\n🎬 {title} ({year})")
+        print(f"   IMDb: {imdb_id}")
+
+        score = get_tomato_score(imdb_id)
+        if score is None:
+            print("   ❓ No Tomato score found — skipping")
+            continue
+
+        print(f"   🍅 Rotten Tomatoes: {score}%")
+
+        if score >= args.threshold:
+            print(f"   👍 Keeping (>= {args.threshold}%)")
+            continue
+
+        # Below threshold → interactive or forced delete
+        if args.force:
+            print("   💀 FORCE MODE — deleting…")
+            if delete_movie(movie_id):
+                print("   🧨 Deleted!")
+                deleted.append(f"{title} ({year}) — {score}%")
+            else:
+                print("   ❌ Failed to delete")
+            continue
+
+        # Interactive mode
+        ans = input(f"   ⚠️ {score}% — delete this movie? (y/N): ").strip().lower()
+        if ans == "y":
+            if delete_movie(movie_id):
+                print("   🧨 Deleted!")
+                deleted.append(f"{title} ({year}) — {score}%")
+            else:
+                print("   ❌ Failed to delete")
+        else:
+            print("   ⏭️ Skipped")
+
+    # ------------------------------
+    # Discord summary
+    # ------------------------------
+    if args.discord:
+        summary = (
+            f"**🍅 Rotten Tomatoes Cleanup Report**\n"
+            f"Checked: **{total_checked}** movies\n"
+            f"Deleted: **{len(deleted)}** movies\n\n"
+        )
+        if deleted:
+            summary += "**Removed titles:**\n" + "\n".join(f"- {d}" for d in deleted)
+
+        send_discord(args.discord, summary)
+
+
+if __name__ == "__main__":
+    main()
