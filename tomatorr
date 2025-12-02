@@ -1,3 +1,5 @@
+# Use this Script to remove movies from your library that are under a specific threshold for rotten tomato score.
+
 #!/usr/bin/env python3
 import requests
 import argparse
